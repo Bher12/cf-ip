@@ -336,6 +336,7 @@ $response = Read-Host "是否立即运行一次 main.py 进行测试？(Y/N)"
 if ($response -eq 'Y' -or $response -eq 'y') {
     Write-Host "正在运行 notify_wrapper.ps1（main.py + 通知）..." -ForegroundColor Cyan
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptDir "notify_wrapper.ps1")
+    Write-Host "（如只想快速自检通知通道，可运行: powershell notify_wrapper.ps1 -TestOnly）" -ForegroundColor DarkGray
 }
 
 Read-Host "`n部署完成，按 Enter 键退出"
