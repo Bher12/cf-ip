@@ -747,7 +747,8 @@ def fetch_additional_source(url):
                 _src_text = resp.text
             except Exception as _e:
                 print("requests failed, try curl fallback: %s" % _e)
-                _r = subprocess.run(['curl.exe', '-sS', '-m', '15', '-A', 'curl/7.79.1', url],
+                _curl = shutil.which("curl") or "curl"  # 跨平台：Linux 下不再写死 curl.exe
+                _r = subprocess.run([_curl, '-sS', '-m', '15', '-A', 'curl/7.79.1', url],
                                     capture_output=True, timeout=25)
                 if _r.returncode != 0 or not _r.stdout:
                     raise
@@ -1765,6 +1766,8 @@ def main():
                     seen.add(key)
                     nodes.append(n)
     print(f"合并后总计 {len(nodes)} 个节点。")
+    # 健康度漏斗统计（借鉴 GFW Radar 连通健康度思路）：记录各阶段节点存量
+    RUN_STATS = {"抓取合并": len(nodes)}
 
     token_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), IP_CALIBRATION_TOKEN_FILE)
     cache_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), IP_CALIBRATION_CACHE_FILE)
@@ -1810,6 +1813,7 @@ def main():
             sys.exit(0)
 
     total = len(nodes)
+    RUN_STATS["前置过滤后"] = total
     print(f"开始 TCP 连接测试（超时 {TIMEOUT}s，并发 {MAX_WORKERS}）...")
 
     results = []
@@ -1828,6 +1832,7 @@ def main():
                 last_print = now
 
     print("\nTCP 测试完成！")
+    RUN_STATS["TCP通过"] = len(results)
     if not results:
         print("没有通过成功率筛选的节点，请检查网络或降低 MIN_SUCCESS_RATE。")
         sys.exit(0)
@@ -1859,6 +1864,9 @@ def main():
 
     candidates_after_availability, avail_ip_info, avail_exit_details = availability_filter_with_retry(candidates)
     candidates_after_http, http_latency_map, http_jitter_map = http_server_filter(candidates_after_availability, cfg)
+    RUN_STATS["候选池"] = len(candidates)
+    RUN_STATS["可用性通过"] = len(candidates_after_availability)
+    RUN_STATS["HTTP通过"] = len(candidates_after_http)
 
     bw_results = []
     for attempt in range(1, BANDWIDTH_RETRY_MAX + 1):
@@ -1869,6 +1877,7 @@ def main():
         if attempt < BANDWIDTH_RETRY_MAX:
             print(f"本轮测速无有效结果，等待 {BANDWIDTH_RETRY_DELAY} 秒后重试...")
             time.sleep(BANDWIDTH_RETRY_DELAY)
+    RUN_STATS["带宽有效"] = len(bw_results)
 
     if not bw_results:
         print("\n带宽测速多次重试仍无有效结果，将使用 TCP 筛选结果作为最终节点。")
@@ -1955,6 +1964,27 @@ def main():
     )
 
     sync_to_github()
+
+    # ---- 运行完成推送：健康度漏斗报告（借鉴 GFW Radar 实时监控思路） ----
+    if ENABLE_WXPUSHER:
+        try:
+            _funnel = " → ".join(
+                f"{k} {v}" for k, v in RUN_STATS.items()
+            )
+            _speed_txt = ""
+            if final_selected:
+                _top_speed = speed_map.get(final_selected[0])
+                _speed_txt = f"（{_top_speed:.2f} Mbps）" if _top_speed else ""
+                _top_line = f"冠军节点：{final_selected[0]}{_speed_txt}"
+            else:
+                _top_line = "本轮无可用节点"
+            send_wxpusher_notification(
+                content=f"【cf-ip 优选完成】最终 {len(final_selected)} 个节点\n"
+                        f"{_top_line}\n健康度漏斗：{_funnel}",
+                summary=f"优选完成 {len(final_selected)} 节点"
+            )
+        except Exception as _e:
+            print(f"发送完成通知失败: {_e}")
 
 if __name__ == "__main__":
     import atexit
