@@ -1066,23 +1066,25 @@ def calibrate_regions(nodes, token_file, cache_file):
 # =========================== 核心测试、筛选、测速及更新函数 ===========================
 
 def test_tcp_latency(ip, port, timeout=TIMEOUT, probes=TCP_PROBES):
-    max_latency = 0.0
-    success = 0
+    samples = []
     for _ in range(probes):
         try:
             start = time.time()
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(timeout)
                 sock.connect((ip, int(port)))
-            latency = time.time() - start
-            if latency > max_latency:
-                max_latency = latency
-            success += 1
+            samples.append(time.time() - start)
         except Exception:
             continue
-    if success == 0:
+    if not samples:
         return float("inf"), 0
-    return max_latency, success
+
+    # 回流 stable 版实测修正（2026-10-29/30）：取低中位数而非 max。
+    # 原来取 max 时，probes 里只要有 1 次撞上链路重传（约 1 秒），节点就被
+    # 记成 1000ms+ 排到队尾挤出前 150 —— 移动→CMI 线路约 15-50% 概率触发。
+    # 低中位数（偶数样本取较小值）才符合「链路真实 RTT」语义。
+    samples.sort()
+    return samples[(len(samples) - 1) // 2], len(samples)
 
 def test_node(node_str):
     m = NODE_PATTERN.match(node_str)
@@ -1128,6 +1130,20 @@ def check_availability(node_str):
         if attempt < max_attempts - 1 and retry_delay > 0:
             time.sleep(retry_delay)
 
+    # SNI 直连兜底：第三方可用性 API 拒判/超时的节点，只要能用 CF SNI 完成
+    # trace 握手，它就是真实可用的 CF 入口（实测 100% 可辨，API 通过率偏低
+    # 是本机网络下候选池缩水的主因）
+    if not success:
+        try:
+            import colo_detect
+            ok, _lat, colo = colo_detect.sni_trace_probe(ip, port, timeout=AVAILABILITY_TIMEOUT)
+            if ok:
+                success = True
+                best_stack = "sni_direct"
+                best_exit_info = {"colo": colo}
+        except Exception:
+            pass
+
     return (node_str, success, best_stack, best_exit_info)
 
 def check_http_server(node_str, timeout, max_retries, retry_delay, method, connect_timeout, inner_retry_enabled):
@@ -1141,34 +1157,63 @@ def check_http_server(node_str, timeout, max_retries, retry_delay, method, conne
     }
 
     test_rounds = max(3, HTTP_JITTER_SAMPLES)
+    # 回流 stable 版容错（2026-10-30 实测修正）：瞬时抖动不应判死节点，
+    # 允许 test_rounds-1 轮失败；节点可用性仍由带宽测速二次把关。
+    allowed_fail = max(1, test_rounds - 1)
     latencies = []
+    failed_rounds = 0
+    max_attempts = (max_retries + 1) if inner_retry_enabled else 1
+    try:
+        import colo_detect
+    except Exception:
+        colo_detect = None
+
     for _ in range(test_rounds):
-        try:
-            start = time.time()
-            request_kwargs = {
-                "timeout": (connect_timeout, timeout),
-                "verify": False,
-                "allow_redirects": False,
-                "headers": headers,
-                "proxies": {"http": None, "https": None}
-            }
+        last_error = "connection_error"
+        for attempt in range(max_attempts):
+            # 优先 SNI 直连探测：TLS-only 合作段节点用明文 HTTP 会拿到
+            # 无 trace 体的 400/403，被旧逻辑整批误杀（实测通过率 1/34）
+            if colo_detect is not None:
+                _ok, _lat, _colo = colo_detect.sni_trace_probe(ip, port, timeout=connect_timeout or 4)
+                if _ok:
+                    latencies.append(_lat)
+                    break
+            try:
+                start = time.time()
+                request_kwargs = {
+                    "timeout": (connect_timeout, timeout),
+                    "verify": False,
+                    "allow_redirects": False,
+                    "headers": headers,
+                    "proxies": {"http": None, "https": None}
+                }
 
-            if method.upper() == "HEAD":
-                resp = requests.head(url, **request_kwargs)
-            else:
-                resp = requests.get(url, **request_kwargs)
+                if method.upper() == "HEAD":
+                    resp = requests.head(url, **request_kwargs)
+                else:
+                    resp = requests.get(url, **request_kwargs)
 
-            lat = (time.time() - start) * 1000
-            if resp.status_code != 400:
-                return (node_str, False, f"status_{resp.status_code}", 0.0, 0.0)
-            server = resp.headers.get("server", "")
-            if not server.lower().startswith("cloudflare"):
-                return (node_str, False, server, 0.0, 0.0)
-            latencies.append(lat)
-        except Exception:
-            return (node_str, False, "connection_error", 0.0, 0.0)
+                lat = (time.time() - start) * 1000
+                if resp.status_code != 400:
+                    last_error = f"status_{resp.status_code}"
+                    continue
+                server = resp.headers.get("server", "")
+                if not server.lower().startswith("cloudflare"):
+                    last_error = server
+                    continue
+                latencies.append(lat)
+                break
+            except Exception:
+                last_error = "connection_error"
+                if attempt < max_attempts - 1 and retry_delay > 0:
+                    time.sleep(retry_delay)
+        else:
+            # 该轮重试耗尽仍失败：未超过容忍额度则继续下一轮
+            failed_rounds += 1
+            if failed_rounds > allowed_fail:
+                return (node_str, False, last_error, 0.0, 0.0)
 
-    if len(latencies) < test_rounds:
+    if len(latencies) < test_rounds - allowed_fail:
         return (node_str, False, "not_enough_samples", 0.0, 0.0)
 
     # 用平均值算抖动（真实波动）
@@ -1176,8 +1221,9 @@ def check_http_server(node_str, timeout, max_retries, retry_delay, method, conne
     variance = sum((l - mean_lat) ** 2 for l in latencies) / len(latencies)
     jitter = variance ** 0.5
 
-    # 返回给外层的延迟用最大值（最差一次）
-    avg_lat = max(latencies)
+    # 回流 stable 版口径：返回低中位数（最接近链路真实 RTT），不用 max 惩罚
+    latencies.sort()
+    avg_lat = latencies[(len(latencies) - 1) // 2]
     return (node_str, True, "cloudflare", avg_lat, jitter)
 
 def availability_filter_candidates(candidates):
@@ -1910,7 +1956,21 @@ def main():
         scored_nodes.sort(key=lambda x: x[1], reverse=True)
 
         if USE_GLOBAL_MODE:
-            final_selected = [item[0] for item in scored_nodes[:GLOBAL_TOP_N]]
+            # 同 /24 网段多样性上限（借鉴 stable 版规模控制）：同段节点路由、
+            # 风控、封锁行为高度同源，宁缺毋滥换路由
+            _cap = int(cfg.get("MAX_PER_24_GLOBAL", 3))
+            _seg_count = {}
+            final_selected = []
+            for item in scored_nodes:
+                node = item[0]
+                _ip = node.split('#')[0].split(':')[0]
+                _seg = '.'.join(_ip.split('.')[:3]) if _ip.count('.') == 3 else _ip
+                if _seg_count.get(_seg, 0) >= _cap:
+                    continue
+                _seg_count[_seg] = _seg_count.get(_seg, 0) + 1
+                final_selected.append(node)
+                if len(final_selected) >= GLOBAL_TOP_N:
+                    break
         else:
             country_scored = defaultdict(list)
             for item in scored_nodes:
