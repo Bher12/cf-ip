@@ -1941,6 +1941,32 @@ def main():
                 line += f" 延迟 {tcp_lat*1000:.2f} ms"
             print(line)
 
+    # ---- 落地机场（colo）识别：借鉴 GFW Radar 真实落地信息 ----
+    if cfg.get("COLO_DETECT_ENABLED", True):
+        try:
+            import colo_detect
+            _preferred = cfg.get("COLO_PREFERRED",
+                                 ["HKG", "NRT", "KIX", "ICN", "SIN", "LAX", "SJC", "SEA"])
+            _colo_map = colo_detect.detect_colos(final_selected)
+            _detected = sum(1 for v in _colo_map.values() if v.get("colo"))
+            (final_selected, speed_map, latency_map,
+             http_latency_map, http_jitter_map) = colo_detect.retag_nodes(
+                final_selected, _colo_map,
+                speed_map=speed_map, latency_map=latency_map,
+                http_latency_map=http_latency_map, http_jitter_map=http_jitter_map)
+            # 机场加成重排：落点在偏好机场的节点轻微加分（仅全局模式）
+            _sc = locals().get("scored_nodes")
+            if USE_GLOBAL_MODE and _sc:
+                _score_map = {item[0]: item[1] for item in _sc}
+                colo_detect.rerank_by_colo(final_selected, _score_map, _colo_map, _preferred)
+            print(f"\n落地机场识别完成（{_detected}/{len(final_selected)} 个节点）：")
+            for _n in final_selected:
+                print(f"  {_n}")
+            print("落地分布：" + colo_detect.format_distribution(final_selected))
+            RUN_STATS["落地机场"] = _detected
+        except Exception as _e:
+            print(f"落地机场识别失败（不影响主流程）: {_e}")
+
     write_ip_txt(final_selected, OUTPUT_FILE,
                  AD_HEADER_ENABLED, AD_HEADER_LINES,
                  AD_FOOTER_ENABLED, AD_FOOTER_LINES,
@@ -1978,9 +2004,17 @@ def main():
                 _top_line = f"冠军节点：{final_selected[0]}{_speed_txt}"
             else:
                 _top_line = "本轮无可用节点"
+            _colo_line = ""
+            try:
+                import colo_detect as _cd
+                _dist_txt = _cd.format_distribution(final_selected)
+                if _dist_txt:
+                    _colo_line = f"\n落地分布：{_dist_txt}"
+            except Exception:
+                pass
             send_wxpusher_notification(
                 content=f"【cf-ip 优选完成】最终 {len(final_selected)} 个节点\n"
-                        f"{_top_line}\n健康度漏斗：{_funnel}",
+                        f"{_top_line}\n健康度漏斗：{_funnel}{_colo_line}",
                 summary=f"优选完成 {len(final_selected)} 节点"
             )
         except Exception as _e:
