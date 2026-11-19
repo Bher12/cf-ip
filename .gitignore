@@ -3,6 +3,17 @@ git_sync.ps1
 git_sync.sh
 __pycache__/
 .run.lock
-notify.log
-*.log
 
+# 日志（含轮转后的 *.log.1 / *.log.2）
+*.log
+*.log.*
+
+# 本地备份副本（main.py.bak.20261119_0144 等）
+*.bak
+*.bak.*
+*.bak_*
+
+# 本机运行时状态
+.fallback_streak
+.last_fallback_notify
+ipv6_geo_cache.json
