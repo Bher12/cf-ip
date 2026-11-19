@@ -17,3 +17,5 @@ __pycache__/
 .fallback_streak
 .last_fallback_notify
 ipv6_geo_cache.json
+# 本机部署笔记（含网络状况与密钥操作细节，不对外公开）
+CHANGELOG_CONFIG_NOTES.md
